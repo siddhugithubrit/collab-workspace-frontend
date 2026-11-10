@@ -1,28 +1,20 @@
 'use client'
 
+import * as encoding from 'lib0/encoding'
+import * as decoding from 'lib0/decoding'
+import * as syncProtocol from 'y-protocols/sync'
+import * as awarenessProtocol from 'y-protocols/awareness'
 import { useEffect, useState, useRef } from 'react'
-import { Editor } from '@tiptap/core'
-import Document from '@tiptap/extension-document'
-import Paragraph from '@tiptap/extension-paragraph'
-import Text from '@tiptap/extension-text'
-import Bold from '@tiptap/extension-bold'
-import Italic from '@tiptap/extension-italic'
-import Heading from '@tiptap/extension-heading'
-import BulletList from '@tiptap/extension-bullet-list'
-import OrderedList from '@tiptap/extension-ordered-list'
-import ListItem from '@tiptap/extension-list-item'
+import { useEditor, EditorContent } from '@tiptap/react'
+import StarterKit from '@tiptap/starter-kit'
 import * as Y from 'yjs'
-import { WebsocketProvider } from 'y-websocket'
 
 const Collaboration = require('@tiptap/extension-collaboration').default || require('@tiptap/extension-collaboration')
 const CollaborationCursor = require('@tiptap/extension-collaboration-cursor').default || require('@tiptap/extension-collaboration-cursor')
 
 export default function CollaborativeEditor() {
-  const editorRef = useRef<HTMLDivElement | null>(null)
-  const [editorInstance, setEditorInstance] = useState<Editor | null>(null)
-  
   const [isMounted, setIsMounted] = useState(false)
-  const [userInfo, setUserInfo] = useState<{ name: string; color: string; gender: string; avatarUrl: string } | null>(null)
+  const [userInfo, setUserInfo] = useState<{ name: string; color: string; avatarUrl: string } | null>(null)
   const [activeUsers, setActiveUsers] = useState<any[]>([])
   const [permission, setPermission] = useState<'edit' | 'view' | 'comment'>('edit')
   
@@ -32,118 +24,156 @@ export default function CollaborativeEditor() {
   const [versions, setVersions] = useState<{ id: string; title: string; time: string; content: string }[]>([])
   const [showVersionModal, setShowVersionModal] = useState(false)
 
+  const ydocRef = useRef<Y.Doc | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
+
+  if (!ydocRef.current) {
+    ydocRef.current = new Y.Doc()
+  }
+  const ydoc = ydocRef.current
+
+  // Use TipTap official React hook for flawless DOM mounting & cursor
+  const editor = useEditor({
+    immediatelyRender: false,
+    editable: permission !== 'view',
+    extensions: [
+      StarterKit.configure({ history: false }),
+      Collaboration.configure({ document: ydoc }),
+      CollaborationCursor.configure({
+        provider: { awareness: new awarenessProtocol.Awareness(ydoc) },
+        user: userInfo ? { name: userInfo.name, color: userInfo.color } : { name: 'User', color: '#000' },
+      }),
+    ],
+    content: '<p>Start collaborating here...</p>',
+  })
+
   useEffect(() => {
     setIsMounted(true)
+    const awareness = new awarenessProtocol.Awareness(ydoc)
 
-    // 1. Yjs Doc आणि Websocket Provider तयार करणे
-    const ydoc = new Y.Doc()
-    const provider = new WebsocketProvider(
-      'ws://localhost:1234',
-      'collab-editor-room-v2',
-      ydoc
-    )
-    const yCommentsArray = ydoc.getArray('comments')
-
-    // युजर प्रोफाइल्स सेट करणे
     const profiles = [
-      { name: 'Rahul', gender: 'male', color: '#FBBC88', seed: 'Rahul-Male' },
-      { name: 'Priya', gender: 'female', color: '#F98181', seed: 'Priya-Female' },
-      { name: 'Amit', gender: 'male', color: '#958DF1', seed: 'Amit-Male' },
-      { name: 'Sneha', gender: 'female', color: '#70CFF8', seed: 'Sneha-Female' }
+      { name: 'Rahul', color: '#FBBC88', seed: 'Rahul-Male' },
+      { name: 'Priya', color: '#F98181', seed: 'Priya-Female' },
+      { name: 'Amit', color: '#958DF1', seed: 'Amit-Male' },
+      { name: 'Sneha', color: '#70CFF8', seed: 'Sneha-Female' }
     ]
-
-    const existingStates = Array.from(provider.awareness.getStates().values())
-    const takenNames = existingStates.map((s: any) => s.user?.name?.split('-')[0]).filter(Boolean)
-    const availableProfiles = profiles.filter(p => !takenNames.includes(p.name))
-    const selectedProfile = availableProfiles.length > 0 
-      ? availableProfiles[Math.floor(Math.random() * availableProfiles.length)]
-      : profiles[Math.floor(Math.random() * profiles.length)]
-
+    const selectedProfile = profiles[Math.floor(Math.random() * profiles.length)]
     const uniqueNumber = Math.floor(Math.random() * 90) + 10
     const avatarUrl = `https://api.dicebear.com/7.x/avataaars/svg?seed=${selectedProfile.seed}-${uniqueNumber}&radius=50`
 
     const currentUser = {
-      name: `${selectedProfile.name}-${uniqueNumber}`,
+      name: `Siddhesh-${uniqueNumber}`,
       color: selectedProfile.color,
-      gender: selectedProfile.gender,
       avatarUrl: avatarUrl
     }
-
     setUserInfo(currentUser)
-    provider.awareness.setLocalStateField('user', currentUser)
+    awareness.setLocalStateField('user', currentUser)
 
-    const handleAwarenessChange = () => {
-      const states = Array.from(provider.awareness.getStates().values())
-      setActiveUsers(states.map((s: any) => s.user).filter(Boolean))
+    const ws = new WebSocket('ws://localhost:1234/collab-editor-room-v2')
+    wsRef.current = ws
+    ws.binaryType = 'arraybuffer'
+
+    ws.onopen = () => {
+      try {
+        const encoder = encoding.createEncoder()
+        encoding.writeVarUint(encoder, 0)
+        syncProtocol.writeSyncStep1(encoder, ydoc)
+        ws.send(encoding.toUint8Array(encoder))
+
+        const awarenessStates = awareness.getStates()
+        if (awarenessStates.size > 0) {
+          const enc = encoding.createEncoder()
+          encoding.writeVarUint(enc, 1)
+          encoding.writeVarUint8Array(enc, awarenessProtocol.encodeAwarenessUpdate(awareness, Array.from(awarenessStates.keys())))
+          ws.send(encoding.toUint8Array(enc))
+        }
+      } catch (e) {
+        console.error('Error on WS open sync:', e)
+      }
     }
 
-    provider.awareness.on('change', handleAwarenessChange)
+    ws.onmessage = (event) => {
+      try {
+        const decoder = decoding.createDecoder(new Uint8Array(event.data))
+        if (!decoding.hasContent(decoder)) return
+        const messageType = decoding.readVarUint(decoder)
+
+        if (messageType === 0) {
+          if (!decoding.hasContent(decoder)) return
+          const encoder = encoding.createEncoder()
+          encoding.writeVarUint(encoder, 0)
+          syncProtocol.readSyncMessage(decoder, encoder, ydoc, ws)
+          if (encoding.length(encoder) > 1) {
+            ws.send(encoding.toUint8Array(encoder))
+          }
+        } else if (messageType === 1) {
+          awarenessProtocol.applyAwarenessUpdate(awareness, decoding.readVarUint8Array(decoder), ws)
+        }
+      } catch (err) {
+        console.warn('⚠️ Ignored WS message safely')
+      }
+    }
+
+    const updateHandler = (update: Uint8Array, origin: any) => {
+      if (origin !== 'remote' && ws.readyState === WebSocket.OPEN) {
+        try {
+          const encoder = encoding.createEncoder()
+          encoding.writeVarUint(encoder, 0)
+          syncProtocol.writeUpdate(encoder, update)
+          ws.send(encoding.toUint8Array(encoder))
+        } catch (e) {
+          console.error('Error sending update:', e)
+        }
+      }
+    }
+    ydoc.on('update', updateHandler)
+
+    const handleAwarenessChange = () => {
+      const states = Array.from(awareness.getStates().values())
+      setActiveUsers(states.map((s: any) => s.user).filter(Boolean))
+    }
+    awareness.on('change', handleAwarenessChange)
     handleAwarenessChange()
 
+    const yCommentsArray = ydoc.getArray('comments')
     const updateComments = () => {
       setComments(yCommentsArray.toArray())
     }
     yCommentsArray.observe(updateComments)
     updateComments()
 
-    // 2. मॅन्युअली TipTap एडिटर इन्स्टन्स तयार करणे (ज्यामुळे कधीही डुप्लिकेट प्लगइन एरर येणार नाही)
-    if (editorRef.current && !editorInstance) {
-      const newEditor = new Editor({
-        element: editorRef.current,
-        // immediatelyRender: false, -> हा ऑप्शन इथे काढ John/Siddhesh
-        editable: permission !== 'view',
-        extensions: [
-          Document,
-          Paragraph,
-          Text,
-          Bold,
-          Italic,
-          Heading.configure({ levels: [1, 2, 3] }),
-          BulletList,
-          OrderedList,
-          ListItem,
-          Collaboration.configure({
-            document: ydoc,
-          }),
-          CollaborationCursor.configure({
-            provider: provider,
-            user: {
-              name: currentUser.name,
-              color: currentUser.color,
-            },
-          }),
-        ],
-        content: '<p>Welcome to your collaborative workspace, Siddhesh! Real-time sync stable...</p>',
-      })
-
-      setEditorInstance(newEditor)
-    }
-
     return () => {
-      provider.awareness.off('change', handleAwarenessChange)
+      ydoc.off('update', updateHandler)
       yCommentsArray.unobserve(updateComments)
-      provider.destroy()
+      awareness.off('change', handleAwarenessChange)
+      if (ws.readyState === WebSocket.OPEN) ws.close()
     }
   }, [])
 
   useEffect(() => {
-    if (editorInstance) {
-      editorInstance.setEditable(permission !== 'view')
+    if (editor) {
+      editor.setEditable(permission !== 'view')
     }
-  }, [permission, editorInstance])
+  }, [permission, editor])
 
   const handleAddComment = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!newCommentText.trim() || !userInfo) return
+    if (!newCommentText.trim() || !userInfo || !ydocRef.current) return
 
-    // yCommentsArray ॲक्सेस करण्यासाठी सोपी पद्धत
-    // (किंवा थेट ydoc मधून घेऊ शकता)
+    const yCommentsArray = ydocRef.current.getArray('comments')
+    yCommentsArray.push([{
+      id: Date.now().toString(),
+      text: newCommentText,
+      author: userInfo.name,
+      avatar: userInfo.avatarUrl,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    }])
     setNewCommentText('')
   }
 
   const handleSaveSnapshot = () => {
-    if (!editorInstance) return
-    const currentHtml = editorInstance.getHTML()
+    if (!editor) return
+    const currentHtml = editor.getHTML()
     const newVersion = {
       id: Date.now().toString(),
       title: `Snapshot v${versions.length + 1}`,
@@ -155,114 +185,136 @@ export default function CollaborativeEditor() {
   }
 
   const handleRestoreVersion = (content: string) => {
-    if (!editorInstance) return
-    editorInstance.commands.setContent(content)
+    if (!editor) return
+    editor.commands.setContent(content)
     setShowVersionModal(false)
   }
 
   if (!isMounted) {
-    return <div className="p-4 text-gray-500">Connecting to collaborative room...</div>
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-gray-50">
+        <div className="text-gray-500 font-medium animate-pulse">Connecting to collaborative room...</div>
+      </div>
+    )
   }
 
   return (
-    <div className="max-w-6xl mx-auto p-4">
-      {/* Top Header & Toolbar */}
-      <div className="flex items-center justify-between mb-4 bg-gray-50 p-3 rounded-lg border shadow-sm">
-        <div className="flex items-center gap-3">
-          <h2 className="text-sm font-semibold text-gray-700">Online Users ({activeUsers.length}):</h2>
-          <div className="flex items-center gap-2">
-            {activeUsers.map((user, index) => (
-              <div
-                key={index}
-                className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-white border shadow-sm"
-              >
-                <img src={user.avatarUrl} alt={user.name} className="w-5 h-5 rounded-full border bg-gray-100" />
-                <span className="text-gray-800 font-medium">{user.name}</span>
-                <span className="w-2 h-2 rounded-full" style={{ backgroundColor: user.color }}></span>
-              </div>
-            ))}
-          </div>
+    <div className="main-container">
+      {/* Top Header & Global Toolbar */}
+      <div className="top-header">
+        <div>
+          <h1 style={{ fontWeight: 'bold', fontSize: '18px', color: '#0f172a' }}>Collaborative Workspace</h1>
+          <p style={{ fontSize: '12px', color: '#64748b' }}>Real-time multi-user document engine</p>
         </div>
 
-        <div className="flex items-center gap-3">
-          <button
+        {/* Action Controls */}
+        <div className="action-buttons">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', background: '#f1f5f9', padding: '6px 10px', borderRadius: '6px', border: '1px solid #cbd5e1' }}>
+            <span style={{ fontSize: '11px', fontWeight: '600', color: '#64748b' }}>Access:</span>
+            <select 
+              value={permission} 
+              onChange={(e: any) => setPermission(e.target.value)}
+              style={{ fontSize: '12px', background: '#ffffff', border: '1px solid #cbd5e1', borderRadius: '4px', padding: '4px 6px', cursor: 'pointer' }}
+            >
+              <option value="edit">Can Edit</option>
+              <option value="comment">Comment Only</option>
+              <option value="view">View Only</option>
+            </select>
+          </div>
+
+          <button 
             onClick={handleSaveSnapshot}
-            className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs px-3 py-1.5 rounded-md font-medium transition shadow-2xs"
+            className="btn-primary"
+            style={{ backgroundColor: '#16a34a' }}
           >
             Save Snapshot
           </button>
-          
-          <button
+
+          <button 
             onClick={() => setShowVersionModal(true)}
-            className="bg-gray-800 hover:bg-gray-900 text-white text-xs px-3 py-1.5 rounded-md font-medium transition shadow-2xs"
+            className="btn-secondary"
           >
             Version History ({versions.length})
           </button>
-
-          <div className="flex items-center gap-1.5 pl-2 border-l">
-            <span className="text-xs font-medium text-gray-500">Permission:</span>
-            <select
-              value={permission}
-              onChange={(e) => setPermission(e.target.value as any)}
-              className="text-xs border rounded-md px-2 py-1 bg-white font-medium text-gray-700 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-            >
-              <option value="edit">Can Edit</option>
-              <option value="comment">Can Comment</option>
-              <option value="view">Can View</option>
-            </select>
-          </div>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        {/* TipTap Editor Box using useRef */}
-        <div className="md:col-span-2 border p-4 rounded-lg min-h-[350px] bg-white text-black relative shadow-sm">
+      {/* Online Users Banner */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', background: '#ffffff', padding: '10px 14px', borderRadius: '8px', border: '1px solid #e2e8f0', marginBottom: '16px' }}>
+        <span style={{ fontSize: '11px', fontWeight: 'bold', color: '#64748b', textTransform: 'uppercase' }}>Online Users ({activeUsers.length}):</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+          {activeUsers.map((user, index) => (
+            <div key={index} style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '4px 10px', borderRadius: '20px', fontSize: '12px', background: '#f8fafc', border: '1px solid #e2e8f0' }}>
+              <img 
+                src={user.avatarUrl} 
+                alt={user.name} 
+                style={{ width: '22px', height: '22px', minWidth: '22px', minHeight: '22px', borderRadius: '50%', objectFit: 'cover' }} 
+              />
+              <span style={{ fontWeight: '600', color: '#1e293b' }}>{user.name}</span>
+              <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: user.color }}></span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Main Layout: Side-by-Side Flexbox */}
+      <div className="workspace-layout" style={{ position: 'relative' }}>
+        {/* TipTap Editor Box using official EditorContent */}
+        <div className="editor-box" style={{ position: 'relative', cursor: 'text' }} onClick={() => editor?.chain().focus().run()}>
           {permission === 'view' && (
-            <div className="absolute top-2 right-2 bg-yellow-100 text-yellow-800 text-xs px-2 py-0.5 rounded font-medium">
+            <div style={{ position: 'absolute', top: '12px', right: '12px', background: '#fef08a', color: '#854d0e', fontSize: '11px', padding: '4px 8px', borderRadius: '4px', fontWeight: '600', zIndex: 10 }}>
               View Only Mode
             </div>
           )}
-          <div ref={editorRef} className="outline-none min-h-[300px] cursor-text" />
+          <h3 style={{ fontSize: '11px', fontWeight: 'bold', color: '#4f46e5', textTransform: 'uppercase', marginBottom: '10px', letterSpacing: '0.05em' }}>Workspace Editor</h3>
+          
+          <div style={{ minHeight: '420px', width: '100%', border: '1px solid #cbd5e1', borderRadius: '6px', padding: '12px', background: '#ffffff', color: '#000000' }}>
+            <EditorContent editor={editor} />
+          </div>
         </div>
 
         {/* Comments Sidebar */}
-        <div className="border bg-gray-50 rounded-lg p-3 flex flex-col justify-between shadow-sm h-[400px]">
+        <div className="comments-sidebar">
           <div>
-            <h3 className="text-xs font-bold text-gray-700 uppercase tracking-wider mb-3">Live Comments ({comments.length})</h3>
+            <h3 style={{ fontSize: '11px', fontWeight: 'bold', color: '#334155', textTransform: 'uppercase', marginBottom: '12px', letterSpacing: '0.05em' }}>Live Comments ({comments.length})</h3>
             
-            <div className="overflow-y-auto max-h-[260px] space-y-2.5 pr-1">
+            <div style={{ maxHeight: '360px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '8px' }}>
               {comments.length === 0 ? (
-                <p className="text-xs text-gray-400 italic text-center mt-10">No comments yet. Start a discussion!</p>
+                <p style={{ fontSize: '12px', color: '#94a3b8', fontStyle: 'italic', textAlign: 'center', marginTop: '150px' }}>No comments yet. Start a discussion!</p>
               ) : (
                 comments.map((c) => (
-                  <div key={c.id} className="bg-white p-2.5 rounded-md border text-xs shadow-2xs">
-                    <div className="flex items-center justify-between mb-1">
-                      <div className="flex items-center gap-1.5">
-                        <img src={c.avatar} alt={c.author} className="w-4 h-4 rounded-full border" />
-                        <span className="font-bold text-gray-800">{c.author}</span>
+                  <div key={c.id} style={{ background: '#f8fafc', padding: '10px', borderRadius: '6px', border: '1px solid #e2e8f0', fontSize: '12px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <img 
+                          src={c.avatar} 
+                          alt={c.author} 
+                          style={{ width: '18px', height: '18px', borderRadius: '50%', objectFit: 'cover' }} 
+                        />
+                        <span style={{ fontWeight: 'bold', color: '#1e293b' }}>{c.author}</span>
                       </div>
-                      <span className="text-[10px] text-gray-400">{c.timestamp}</span>
+                      <span style={{ fontSize: '9px', color: '#94a3b8' }}>{c.timestamp}</span>
                     </div>
-                    <p className="text-gray-600 pl-5">{c.text}</p>
+                    <p style={{ color: '#475569', paddingLeft: '24px', margin: 0 }}>{c.text}</p>
                   </div>
                 ))
               )}
             </div>
           </div>
 
-          <form onSubmit={handleAddComment} className="mt-3 pt-2 border-t flex gap-2">
+          <form onSubmit={handleAddComment} style={{ marginTop: '12px', paddingTop: '12px', borderTop: '1px solid #e2e8f0', display: 'flex', gap: '8px' }}>
             <input
               type="text"
               value={newCommentText}
               onChange={(e) => setNewCommentText(e.target.value)}
               placeholder={permission === 'view' ? "View only mode..." : "Write a comment..."}
               disabled={permission === 'view'}
-              className="flex-1 text-xs border rounded-md px-2.5 py-1.5 bg-white focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:bg-gray-100"
+              style={{ flex: 1, fontSize: '12px', border: '1px solid #cbd5e1', borderRadius: '6px', padding: '8px', background: '#f8fafc', outline: 'none' }}
             />
             <button
               type="submit"
               disabled={permission === 'view'}
-              className="bg-indigo-600 hover:bg-indigo-700 text-white text-xs px-3 py-1.5 rounded-md font-medium transition disabled:opacity-50"
+              className="btn-primary"
             >
               Post
             </button>
@@ -270,32 +322,33 @@ export default function CollaborativeEditor() {
         </div>
       </div>
 
+      {/* Version History Modal */}
       {showVersionModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-lg max-w-md w-full p-5 shadow-xl">
-            <div className="flex justify-between items-center mb-4 border-b pb-2">
-              <h3 className="text-sm font-bold text-gray-800">Document Version History</h3>
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: '16px' }}>
+          <div style={{ background: '#ffffff', borderRadius: '12px', maxWidth: '400px', width: '100%', padding: '20px', boxShadow: '0 20px 25px -5px rgb(0 0 0 / 0.1)' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', borderBottom: '1px solid #e2e8f0', paddingBottom: '8px' }}>
+              <h3 style={{ fontSize: '14px', fontWeight: 'bold', color: '#1e293b', margin: 0 }}>Document Version History</h3>
               <button 
                 onClick={() => setShowVersionModal(false)}
-                className="text-gray-400 hover:text-gray-600 text-sm font-bold"
+                style={{ background: 'none', border: 'none', color: '#94a3b8', fontSize: '16px', fontWeight: 'bold', cursor: 'pointer' }}
               >
                 ✕
               </button>
             </div>
 
-            <div className="max-h-[300px] overflow-y-auto space-y-2 mb-4">
+            <div style={{ maxHeight: '250px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '16px' }}>
               {versions.length === 0 ? (
-                <p className="text-xs text-gray-400 text-center py-6">No snapshots saved yet. Click 'Save Snapshot' to record versions.</p>
+                <p style={{ fontSize: '12px', color: '#94a3b8', textAlign: 'center', padding: '40px 0' }}>No snapshots saved yet. Click 'Save Snapshot' to record versions.</p>
               ) : (
                 versions.map((ver) => (
-                  <div key={ver.id} className="flex items-center justify-between p-2.5 border rounded-md hover:bg-gray-50 text-xs">
-                    <div>
-                      <p className="font-bold text-gray-800">{ver.title}</p>
-                      <p className="text-[10px] text-gray-400">{ver.time}</p>
+                  <div key={ver.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px', border: '1px solid #e2e8f0', borderRadius: '6px', fontSize: '12px' }}>
+                    <div style={{ flex: 1 }}>
+                      <p style={{ fontWeight: 'bold', color: '#1e293b', margin: 0 }}>{ver.title}</p>
+                      <p style={{ fontSize: '10px', color: '#94a3b8', margin: 0 }}>{ver.time}</p>
                     </div>
                     <button
                       onClick={() => handleRestoreVersion(ver.content)}
-                      className="bg-indigo-50 text-indigo-600 hover:bg-indigo-100 px-2.5 py-1 rounded font-medium transition"
+                      style={{ background: '#eff6ff', color: '#2563eb', border: '1px solid #bfdbfe', padding: '6px 10px', borderRadius: '4px', fontWeight: '600', cursor: 'pointer', fontSize: '11px' }}
                     >
                       Restore
                     </button>
@@ -306,7 +359,7 @@ export default function CollaborativeEditor() {
 
             <button
               onClick={() => setShowVersionModal(false)}
-              className="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs py-2 rounded font-medium transition"
+              style={{ width: '100%', background: '#f1f5f9', border: '1px solid #cbd5e1', color: '#334155', fontSize: '12px', padding: '10px', borderRadius: '6px', fontWeight: '600', cursor: 'pointer' }}
             >
               Close
             </button>

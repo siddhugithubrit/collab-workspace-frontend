@@ -1,69 +1,106 @@
-require('dotenv').config({path:'C:\\Users\\ADMIN\\collab-workspace\\prisma\\.env'});
 const WebSocket = require('ws');
+const http = require('http');
+const Y = require('yjs');
+const syncProtocol = require('y-protocols/sync');
+const awarenessProtocol = require('y-protocols/awareness');
 const Redis = require('ioredis');
+const encoding = require('lib0/encoding');
+const decoding = require('lib0/decoding');
 
-const redisConfig = {
-  tls: {
-    rejectUnauthorized: false
-  }
-};
-
-const redisPub = new Redis(process.env.REDIS_URL, redisConfig);
-const redisSub = new Redis(process.env.REDIS_URL, redisConfig);
-
-const CHANNEL = 'collab-editor-room-v2';
-
-const wss = new WebSocket.Server({ port: 1234 });
-
-console.log('WebSocket server running on ws://localhost:1234 with Redis Pub/Sub');
-
-redisSub.subscribe(CHANNEL, (err, count) => {
-  if (err) {
-    console.error('Failed to subscribe to Redis channel:', err);
-  } else {
-    console.log(`Subscribed successfully to Redis channel: ${CHANNEL}`);
-  }
+// Create HTTP server
+const server = http.createServer((request, response) => {
+  response.writeHead(200, { 'Content-Type': 'text/plain' });
+  response.end('Custom Native Yjs Scalable Server Running\n');
 });
 
-const clients = new Map();
+// Setup WebSocket Server on port 1234
+const wss = new WebSocket.Server({ noServer: true });
 
-redisSub.on('message', (channel, messageString) => {
-  if (channel === CHANNEL) {
-    try {
-      const data = JSON.parse(messageString);
-      const senderId = data.senderId;
-      const bufferData = Buffer.from(data.payload, 'base64');
+// Safe Redis client setup with error catching so it never crashes if Redis is offline
+let redisPublisher = null;
+let redisSubscriber = null;
+const ROOM_NAME = 'collab-editor-room-v2';
+const ydoc = new Y.Doc();
+const awareness = new awarenessProtocol.Awareness(ydoc);
 
-      clients.forEach((client, ws) => {
-        if (ws.id !== senderId && ws.readyState === WebSocket.OPEN) {
-          ws.send(bufferData);
-        }
-      });
-    } catch (e) {
-      // ignore parsing errors for raw buffers
+try {
+  redisPublisher = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
+    retryStrategy: () => null // Stop retrying if Redis is not installed/running locally
+  });
+  redisSubscriber = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
+    retryStrategy: () => null
+  });
+
+  redisPublisher.on('error', () => {}); // Suppress unhandled clutter
+  redisSubscriber.on('error', () => {});
+
+  redisSubscriber.subscribe(ROOM_NAME, (err) => {
+    if (!err) {
+      console.log(`✅ Connected to Redis Pub/Sub, subscribed to channel: ${ROOM_NAME}`);
     }
-  }
-});
+  });
+
+  redisSubscriber.on('message', (channel, message) => {
+    if (channel === ROOM_NAME) {
+      const update = new Uint8Array(message);
+      Y.applyUpdate(ydoc, update, 'redis');
+    }
+  });
+
+  ydoc.on('update', (update, origin) => {
+    if (origin !== 'redis' && redisPublisher) {
+      redisPublisher.publish(ROOM_NAME, Buffer.from(update)).catch(() => {});
+    }
+  });
+} catch (e) {
+  console.log('ℹ️ Running in standalone memory mode (Redis offline)');
+}
 
 wss.on('connection', (ws) => {
-  // इथे दुरुस्ती केली आहे: .toString(36).substring(7)
-  ws.id = Math.random().toString(36).substring(7);
-  clients.set(ws, true);
+  const connId = Math.random();
+  console.log(`🔌 New client connected (${connId})`);
+
+  const encoder = encoding.createEncoder();
+  encoding.writeVarUint(encoder, 0);
+  syncProtocol.writeSyncStep1(encoder, ydoc);
+  ws.send(encoding.toUint8Array(encoder));
 
   ws.on('message', (message) => {
-    const payload = {
-      senderId: ws.id,
-      payload: Buffer.from(message).toString('base64')
-    };
+    try {
+      const pub = new Uint8Array(message);
+      const decoder = decoding.createDecoder(pub);
+      if (!decoding.hasContent(decoder)) return;
+      const messageType = decoding.readVarUint(decoder);
 
-    redisPub.publish(CHANNEL, JSON.stringify(payload), (err) => {
-      if (err) {
-        console.error('Failed to publish message to Redis:', err);
+      const replyEncoder = encoding.createEncoder();
+      encoding.writeVarUint(replyEncoder, 0);
+
+      if (messageType === 0) {
+        syncProtocol.readSyncMessage(decoder, replyEncoder, ydoc, ws);
+        if (encoding.length(replyEncoder) > 1) {
+          ws.send(encoding.toUint8Array(replyEncoder));
+        }
+      } else if (messageType === 1) {
+        const awarenessUpdate = decoding.readVarUint8Array(decoder);
+        awarenessProtocol.applyAwarenessUpdate(awareness, awarenessUpdate, ws);
       }
-    });
+    } catch (e) {
+      console.error('Error handling message:', e);
+    }
   });
 
   ws.on('close', () => {
-    clients.delete(ws);
+    console.log(`❌ Client disconnected (${connId})`);
   });
+});
+
+server.on('upgrade', (request, socket, head) => {
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    wss.emit('connection', ws, request);
+  });
+});
+
+const PORT = process.env.PORT || 1234;
+server.listen(PORT, () => {
+  console.log(`🚀 Custom Yjs Server running smoothly on port ${PORT}`);
 });
